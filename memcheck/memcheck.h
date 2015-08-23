@@ -99,6 +99,9 @@ typedef
       VG_USERREQ__ENABLE_ADDR_ERROR_REPORTING_IN_RANGE,
       VG_USERREQ__DISABLE_ADDR_ERROR_REPORTING_IN_RANGE,
 
+      VG_USERREQ__ALLOCATE_CONTEXT,
+      VG_USERREQ__SWITCH_CONTEXT_TO,
+
       /* This is just for memcheck's internal use - don't use it */
       _VG_USERREQ__MEMCHECK_RECORD_OVERLAP_ERROR 
          = VG_USERREQ_TOOL_BASE('M','C') + 256

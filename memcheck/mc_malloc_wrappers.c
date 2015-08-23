@@ -211,7 +211,7 @@ MC_Chunk* create_MC_Chunk ( ThreadId tid, Addr p, SizeT szB,
       the mc->data field isn't visible to the leak checker.  If memory
       management is working correctly, any pointer returned by VG_(malloc)
       should be noaccess as far as the client is concerned. */
-   if (!MC_(check_mem_is_noaccess)( (Addr)mc, sizeof(MC_Chunk), NULL )) {
+   if (!MC_(check_mem_is_noaccess)( (Addr)mc, sizeof(MC_Chunk), tid, NULL )) {
       VG_(tool_panic)("create_MC_Chunk: shadow area is accessible");
    } 
    return mc;
@@ -703,7 +703,8 @@ void MC_(create_mempool)(Addr pool, UInt rzB, Bool is_zeroed)
       management is working correctly, anything pointer returned by
       VG_(malloc) should be noaccess as far as the client is
       concerned. */
-   if (!MC_(check_mem_is_noaccess)( (Addr)mp, sizeof(MC_Mempool), NULL )) {
+   if (!MC_(check_mem_is_noaccess)( (Addr)mp, sizeof(MC_Mempool),
+         VG_(get_running_tid)(), NULL )) {
       VG_(tool_panic)("MC_(create_mempool): shadow area is accessible");
    } 
 

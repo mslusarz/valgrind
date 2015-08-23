@@ -47,6 +47,8 @@
 #include "pub_tool_replacemalloc.h"
 #include "pub_tool_tooliface.h"
 #include "pub_tool_threadstate.h"
+//XXX
+#include "../coregrind/pub_core_threadstate.h"
 
 #include "mc_include.h"
 #include "memcheck.h"   /* for client requests */
@@ -276,6 +278,11 @@ typedef
       UChar vabits8[SM_CHUNKS];
    }
    SecMap;
+typedef
+   struct {
+      UChar ctxbits8[SM_CHUNKS];
+   }
+   CtxMap;
 
 // 3 distinguished secondary maps, one for no-access, one for
 // accessible but undefined, and one for accessible and defined.
@@ -285,9 +292,14 @@ typedef
 #define SM_DIST_DEFINED    2
 
 static SecMap sm_distinguished[3];
+static CtxMap ctx_distinguished;
 
 static INLINE Bool is_distinguished_sm ( SecMap* sm ) {
    return sm >= &sm_distinguished[0] && sm <= &sm_distinguished[2];
+}
+
+static INLINE Bool is_distinguished_ctx ( CtxMap* ctx ) {
+   return ctx == &ctx_distinguished;
 }
 
 // Forward declaration
@@ -310,6 +322,19 @@ static SecMap* copy_for_writing ( SecMap* dist_sm )
    VG_(memcpy)(new_sm, dist_sm, sizeof(SecMap));
    update_SM_counts(dist_sm, new_sm);
    return new_sm;
+}
+
+static CtxMap* copy_ctx_for_writing ( CtxMap* dist_ctx )
+{
+   CtxMap* new_ctx;
+   tl_assert(dist_ctx == &ctx_distinguished);
+
+   new_ctx = VG_(am_shadow_alloc)(sizeof(CtxMap));
+   if (new_ctx == NULL)
+      VG_(out_of_memory_NORETURN)( "memcheck:allocate new CtxMap",
+                                   sizeof(CtxMap) );
+   VG_(memcpy)(new_ctx, dist_ctx, sizeof(CtxMap));
+   return new_ctx;
 }
 
 /* --------------- Stats --------------- */
@@ -366,6 +391,7 @@ static void update_SM_counts(SecMap* oldSM, SecMap* newSM)
    handled using the auxiliary primary map.  
 */
 static SecMap* primary_map[N_PRIMARY_MAP];
+static CtxMap* primary_ctx_map[N_PRIMARY_MAP];
 
 
 /* An entry in the auxiliary primary map.  base must be a 64k-aligned
@@ -605,10 +631,24 @@ static INLINE SecMap** get_secmap_low_ptr ( Addr a )
    return &primary_map[ pm_off ];
 }
 
+static INLINE CtxMap** get_ctxmap_low_ptr ( Addr a )
+{
+   UWord pm_off = a >> 16;
+#  if VG_DEBUG_MEMORY >= 1
+   tl_assert(pm_off < N_PRIMARY_MAP);
+#  endif
+   return &primary_ctx_map[ pm_off ];
+}
+
 static INLINE SecMap** get_secmap_high_ptr ( Addr a )
 {
    AuxMapEnt* am = find_or_alloc_in_auxmap(a);
    return &am->sm;
+}
+
+static INLINE CtxMap** get_ctxmap_high_ptr ( Addr a )
+{
+   return NULL;
 }
 
 static INLINE SecMap** get_secmap_ptr ( Addr a )
@@ -623,9 +663,20 @@ static INLINE SecMap* get_secmap_for_reading_low ( Addr a )
    return *get_secmap_low_ptr(a);
 }
 
+static INLINE CtxMap* get_ctxmap_for_reading_low ( Addr a )
+{
+   return *get_ctxmap_low_ptr(a);
+}
+
 static INLINE SecMap* get_secmap_for_reading_high ( Addr a )
 {
    return *get_secmap_high_ptr(a);
+}
+
+static INLINE CtxMap* get_ctxmap_for_reading_high ( Addr a )
+{
+//   return NULL;
+   return *get_ctxmap_high_ptr(a);
 }
 
 static INLINE SecMap* get_secmap_for_writing_low(Addr a)
@@ -636,11 +687,27 @@ static INLINE SecMap* get_secmap_for_writing_low(Addr a)
    return *p;
 }
 
+static INLINE CtxMap* get_ctxmap_for_writing_low(Addr a)
+{
+   CtxMap** p = get_ctxmap_low_ptr(a);
+   if (UNLIKELY(is_distinguished_ctx(*p)))
+      *p = copy_ctx_for_writing(*p);
+   return *p;
+}
+
 static INLINE SecMap* get_secmap_for_writing_high ( Addr a )
 {
    SecMap** p = get_secmap_high_ptr(a);
    if (UNLIKELY(is_distinguished_sm(*p)))
       *p = copy_for_writing(*p);
+   return *p;
+}
+
+static INLINE CtxMap* get_ctxmap_for_writing_high ( Addr a )
+{
+   CtxMap** p = get_ctxmap_high_ptr(a);
+   if (UNLIKELY(is_distinguished_ctx(*p)))
+      *p = copy_ctx_for_writing(*p);
    return *p;
 }
 
@@ -656,6 +723,13 @@ static INLINE SecMap* get_secmap_for_reading ( Addr a )
           : get_secmap_for_reading_high(a) );
 }
 
+static INLINE CtxMap* get_ctxmap_for_reading ( Addr a )
+{
+   return ( a <= MAX_PRIMARY_ADDRESS
+          ? get_ctxmap_for_reading_low (a)
+          : get_ctxmap_for_reading_high(a) );
+}
+
 /* Produce the secmap for 'a', either from the primary map or by
    ensuring there is an entry for it in the aux primary map.  The
    secmap may not be a distinguished one, since the caller will want
@@ -668,6 +742,13 @@ static INLINE SecMap* get_secmap_for_writing ( Addr a )
    return ( a <= MAX_PRIMARY_ADDRESS
           ? get_secmap_for_writing_low (a)
           : get_secmap_for_writing_high(a) );
+}
+
+static INLINE CtxMap* get_ctxmap_for_writing ( Addr a )
+{
+   return ( a <= MAX_PRIMARY_ADDRESS
+          ? get_ctxmap_for_writing_low (a)
+          : get_ctxmap_for_writing_high(a) );
 }
 
 /* If 'a' has a SecMap, produce it.  Else produce NULL.  But don't
@@ -731,20 +812,36 @@ UChar extract_vabits4_from_vabits8 ( Addr a, UChar vabits8 )
 // is equal to VA_BITS2_PARTDEFINED, then the corresponding entry in the
 // sec-V-bits table must also be set!
 static INLINE
-void set_vabits2 ( Addr a, UChar vabits2 )
+void set_vabits2 ( Addr a, UChar vabits2, UChar ctx )
 {
+   CtxMap* cm       = get_ctxmap_for_writing(a);
    SecMap* sm       = get_secmap_for_writing(a);
    UWord   sm_off   = SM_OFF(a);
-   insert_vabits2_into_vabits8( a, vabits2, &(sm->vabits8[sm_off]) );
+   insert_vabits2_into_vabits8( a, vabits2, &sm->vabits8[sm_off] );
+   insert_vabits2_into_vabits8( a, ctx, &cm->ctxbits8[sm_off] );
 }
 
 static INLINE
-UChar get_vabits2 ( Addr a )
+UChar get_ctxbits2 ( Addr a )
 {
-   SecMap* sm       = get_secmap_for_reading(a);
+   CtxMap* sm       = get_ctxmap_for_reading(a);
    UWord   sm_off   = SM_OFF(a);
-   UChar   vabits8  = sm->vabits8[sm_off];
-   return extract_vabits2_from_vabits8(a, vabits8);
+   UChar   ctxbits8 = sm->ctxbits8[sm_off];
+   return extract_vabits2_from_vabits8(a, ctxbits8);
+}
+
+static INLINE
+UChar get_vabits2 ( Addr a, UChar ctx )
+{
+   UChar ctxbits2 = get_ctxbits2(a);
+   if (LIKELY(ctxbits2 == ctx)) {
+      SecMap* sm       = get_secmap_for_reading(a);
+      UWord   sm_off   = SM_OFF(a);
+      UChar   vabits8  = sm->vabits8[sm_off];
+      return extract_vabits2_from_vabits8(a, vabits8);
+   }
+
+   return VA_BITS2_NOACCESS;
 }
 
 // *** WARNING! ***
@@ -771,14 +868,14 @@ void set_vabits8_for_aligned_word32 ( Addr a, UChar vabits8 )
 
 // Forward declarations
 static UWord get_sec_vbits8(Addr a);
-static void  set_sec_vbits8(Addr a, UWord vbits8);
+static void  set_sec_vbits8(Addr a, UWord vbits8, UChar ctx);
 
 // Returns False if there was an addressability error.
 static INLINE
-Bool set_vbits8 ( Addr a, UChar vbits8 )
+Bool set_vbits8 ( Addr a, UChar vbits8, UChar ctx )
 {
    Bool  ok      = True;
-   UChar vabits2 = get_vabits2(a);
+   UChar vabits2 = get_vabits2(a, ctx);
    if ( VA_BITS2_NOACCESS != vabits2 ) {
       // Addressable.  Convert in-register format to in-memory format.
       // Also remove any existing sec V bit entry for the byte if no
@@ -786,8 +883,8 @@ Bool set_vbits8 ( Addr a, UChar vbits8 )
       if      ( V_BITS8_DEFINED   == vbits8 ) { vabits2 = VA_BITS2_DEFINED;   }
       else if ( V_BITS8_UNDEFINED == vbits8 ) { vabits2 = VA_BITS2_UNDEFINED; }
       else                                    { vabits2 = VA_BITS2_PARTDEFINED;
-                                                set_sec_vbits8(a, vbits8);  }
-      set_vabits2(a, vabits2);
+                                                set_sec_vbits8(a, vbits8, ctx);}
+      set_vabits2(a, vabits2, ctx);
 
    } else {
       // Unaddressable!  Do nothing -- when writing to unaddressable
@@ -801,10 +898,10 @@ Bool set_vbits8 ( Addr a, UChar vbits8 )
 // Returns False if there was an addressability error.  In that case, we put
 // all defined bits into vbits8.
 static INLINE
-Bool get_vbits8 ( Addr a, UChar* vbits8 )
+Bool get_vbits8 ( Addr a, UChar* vbits8, UChar ctx )
 {
    Bool  ok      = True;
-   UChar vabits2 = get_vabits2(a);
+   UChar vabits2 = get_vabits2(a, ctx);
 
    // Convert the in-memory format to in-register format.
    if      ( VA_BITS2_DEFINED   == vabits2 ) { *vbits8 = V_BITS8_DEFINED;   }
@@ -932,7 +1029,7 @@ static OSet* createSecVBitTable(void)
    return newSecVBitTable;
 }
 
-static void gcSecVBitTable(void)
+static void gcSecVBitTable(UChar ctx)
 {
    OSet*        secVBitTable2;
    SecVBitNode* n;
@@ -950,7 +1047,7 @@ static void gcSecVBitTable(void)
       // get_vabits2() for the lookup is not very efficient, but I don't
       // think it matters.
       for (i = 0; i < BYTES_PER_SEC_VBIT_NODE; i++) {
-         if (VA_BITS2_PARTDEFINED == get_vabits2(n->a + i)) {
+         if (VA_BITS2_PARTDEFINED == get_vabits2(n->a + i, ctx)) {
             // Found a non-stale byte, so keep =>
             // Insert a copy of the node into the new table.
             SecVBitNode* n2 = 
@@ -1010,7 +1107,7 @@ static UWord get_sec_vbits8(Addr a)
    return vbits8;
 }
 
-static void set_sec_vbits8(Addr a, UWord vbits8)
+static void set_sec_vbits8(Addr a, UWord vbits8, UChar ctx)
 {
    Addr         aAligned = VG_ROUNDDN(a, BYTES_PER_SEC_VBIT_NODE);
    Int          i, amod  = a % BYTES_PER_SEC_VBIT_NODE;
@@ -1025,7 +1122,7 @@ static void set_sec_vbits8(Addr a, UWord vbits8)
       // Do a table GC if necessary.  Nb: do this before creating and
       // inserting the new node, to avoid erroneously GC'ing the new node.
       if (secVBitLimit == VG_(OSetGen_Size)(secVBitTable)) {
-         gcSecVBitTable();
+         gcSecVBitTable(ctx);
       }
 
       // New node:  assign the specific byte, make the rest invalid (they
@@ -1209,6 +1306,8 @@ void mc_LOADV_128_or_256_slow ( /*OUT*/ULong* res,
    Addr   ai;
    UChar  vbits8;
    Bool   ok;
+   ThreadId tid = VG_(get_running_tid)();
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
 
    /* Code below assumes load size is a power of two and at least 64
       bits. */
@@ -1238,7 +1337,7 @@ void mc_LOADV_128_or_256_slow ( /*OUT*/ULong* res,
       for (i = 8-1; i >= 0; i--) {
          PROF_EVENT(MCPE_LOADV_128_OR_256_SLOW_LOOP);
          ai = a + 8*long_index + byte_offset_w(8, bigendian, i);
-         ok = get_vbits8(ai, &vbits8);
+         ok = get_vbits8(ai, &vbits8, ctx);
          vbits64 <<= 8;
          vbits64 |= vbits8;
          if (!ok) n_addrs_bad++;
@@ -1359,6 +1458,8 @@ ULong mc_LOADVn_slow ( Addr a, SizeT nBits, Bool bigendian )
    Addr   ai;
    UChar  vbits8;
    Bool   ok;
+   ThreadId tid = VG_(get_running_tid)();
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
 
    tl_assert(nBits == 64 || nBits == 32 || nBits == 16 || nBits == 8);
 
@@ -1373,7 +1474,7 @@ ULong mc_LOADVn_slow ( Addr a, SizeT nBits, Bool bigendian )
    for (i = szB-1; i >= 0; i--) {
       PROF_EVENT(MCPE_LOADVN_SLOW_LOOP);
       ai = a + byte_offset_w(szB, bigendian, i);
-      ok = get_vbits8(ai, &vbits8);
+      ok = get_vbits8(ai, &vbits8, ctx);
       vbits64 <<= 8; 
       vbits64 |= vbits8;
       if (!ok) n_addrs_bad++;
@@ -1489,7 +1590,7 @@ void mc_STOREVn_slow ( Addr a, SizeT nBits, ULong vbytes, Bool bigendian )
                           (VA_BITS16_DEFINED   == vabits16 ||
                            VA_BITS16_UNDEFINED == vabits16) )) {
          /* Handle common case quickly: a is suitably aligned, */
-         /* is mapped, and is addressible. */
+         /* is mapped, and is addressable. */
          // Convert full V-bits in register to compact 2-bit form.
          if (LIKELY(V_BITS64_DEFINED == vbytes)) {
             ((UShort*)(sm->vabits8))[sm_off16] = (UShort)VA_BITS16_DEFINED;
@@ -1511,7 +1612,7 @@ void mc_STOREVn_slow ( Addr a, SizeT nBits, ULong vbytes, Bool bigendian )
                           (VA_BITS8_DEFINED   == vabits8 ||
                            VA_BITS8_UNDEFINED == vabits8) )) {
          /* Handle common case quickly: a is suitably aligned, */
-         /* is mapped, and is addressible. */
+         /* is mapped, and is addressable. */
          // Convert full V-bits in register to compact 2-bit form.
          if (LIKELY(V_BITS32_DEFINED == (vbytes & 0xFFFFFFFF))) {
             sm->vabits8[sm_off] = VA_BITS8_DEFINED;
@@ -1527,21 +1628,23 @@ void mc_STOREVn_slow ( Addr a, SizeT nBits, ULong vbytes, Bool bigendian )
    /* ------------ END semi-fast cases ------------ */
 
    tl_assert(nBits == 64 || nBits == 32 || nBits == 16 || nBits == 8);
+   ThreadId tid = VG_(get_running_tid)();
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
 
    /* Dump vbytes in memory, iterating from least to most significant
-      byte.  At the same time establish addressibility of the location. */
+      byte.  At the same time establish addressability of the location. */
    for (i = 0; i < szB; i++) {
       PROF_EVENT(MCPE_STOREVN_SLOW_LOOP);
       ai     = a + byte_offset_w(szB, bigendian, i);
       vbits8 = vbytes & 0xff;
-      ok     = set_vbits8(ai, vbits8);
+      ok     = set_vbits8(ai, vbits8, ctx);
       if (!ok) n_addrs_bad++;
       vbytes >>= 8;
    }
 
    /* If an address error has happened, report it. */
    if (n_addrs_bad > 0)
-      MC_(record_address_error)( VG_(get_running_tid)(), a, szB, True );
+      MC_(record_address_error)( tid, a, szB, True );
 }
 
 
@@ -1855,15 +1958,17 @@ static void make_mem_defined_w_tid ( Addr a, SizeT len, ThreadId tid )
    defined, but if it isn't addressible, leave it alone.  In other
    words a version of MC_(make_mem_defined) that doesn't mess with
    addressibility.  Low-performance implementation. */
-static void make_mem_defined_if_addressable ( Addr a, SizeT len )
+static void make_mem_defined_if_addressable ( Addr a, SizeT len, ThreadId tid )
 {
    SizeT i;
    UChar vabits2;
    DEBUG("make_mem_defined_if_addressable(%p, %llu)\n", a, (ULong)len);
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
+
    for (i = 0; i < len; i++) {
-      vabits2 = get_vabits2( a+i );
+      vabits2 = get_vabits2( a+i, ctx );
       if (LIKELY(VA_BITS2_NOACCESS != vabits2)) {
-         set_vabits2(a+i, VA_BITS2_DEFINED);
+         set_vabits2(a+i, VA_BITS2_DEFINED, ctx);
          if (UNLIKELY(MC_(clo_mc_level) >= 3)) {
             MC_(helperc_b_store1)( a+i, 0 ); /* clear the origin tag */
          } 
@@ -1872,15 +1977,17 @@ static void make_mem_defined_if_addressable ( Addr a, SizeT len )
 }
 
 /* Similarly (needed for mprotect handling ..) */
-static void make_mem_defined_if_noaccess ( Addr a, SizeT len )
+static void make_mem_defined_if_noaccess ( Addr a, SizeT len, ThreadId tid )
 {
    SizeT i;
    UChar vabits2;
    DEBUG("make_mem_defined_if_noaccess(%p, %llu)\n", a, (ULong)len);
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
+
    for (i = 0; i < len; i++) {
-      vabits2 = get_vabits2( a+i );
+      vabits2 = get_vabits2( a+i, ctx );
       if (LIKELY(VA_BITS2_NOACCESS == vabits2)) {
-         set_vabits2(a+i, VA_BITS2_DEFINED);
+         set_vabits2(a+i, VA_BITS2_DEFINED, ctx);
          if (UNLIKELY(MC_(clo_mc_level) >= 3)) {
             MC_(helperc_b_store1)( a+i, 0 ); /* clear the origin tag */
          } 
@@ -1899,6 +2006,8 @@ void MC_(copy_address_range_state) ( Addr src, Addr dst, SizeT len )
 
    DEBUG("MC_(copy_address_range_state)\n");
    PROF_EVENT(MCPE_COPY_ADDRESS_RANGE_STATE);
+   ThreadId tid = VG_(get_running_tid)();
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
 
    if (len == 0 || src == dst)
       return;
@@ -1920,24 +2029,24 @@ void MC_(copy_address_range_state) ( Addr src, Addr dst, SizeT len )
             /* do nothing */
          } else {
             /* have to copy secondary map info */
-            if (VA_BITS2_PARTDEFINED == get_vabits2( src+i+0 ))
-               set_sec_vbits8( dst+i+0, get_sec_vbits8( src+i+0 ) );
-            if (VA_BITS2_PARTDEFINED == get_vabits2( src+i+1 ))
-               set_sec_vbits8( dst+i+1, get_sec_vbits8( src+i+1 ) );
-            if (VA_BITS2_PARTDEFINED == get_vabits2( src+i+2 ))
-               set_sec_vbits8( dst+i+2, get_sec_vbits8( src+i+2 ) );
-            if (VA_BITS2_PARTDEFINED == get_vabits2( src+i+3 ))
-               set_sec_vbits8( dst+i+3, get_sec_vbits8( src+i+3 ) );
+            if (VA_BITS2_PARTDEFINED == get_vabits2( src+i+0, ctx ))
+               set_sec_vbits8( dst+i+0, get_sec_vbits8( src+i+0 ), ctx );
+            if (VA_BITS2_PARTDEFINED == get_vabits2( src+i+1, ctx ))
+               set_sec_vbits8( dst+i+1, get_sec_vbits8( src+i+1 ), ctx );
+            if (VA_BITS2_PARTDEFINED == get_vabits2( src+i+2, ctx ))
+               set_sec_vbits8( dst+i+2, get_sec_vbits8( src+i+2 ), ctx );
+            if (VA_BITS2_PARTDEFINED == get_vabits2( src+i+3, ctx ))
+               set_sec_vbits8( dst+i+3, get_sec_vbits8( src+i+3 ), ctx );
          }
          i += 4;
          len -= 4;
       }
       /* fixup loop */
       while (len >= 1) {
-         vabits2 = get_vabits2( src+i );
-         set_vabits2( dst+i, vabits2 );
+         vabits2 = get_vabits2( src+i, ctx );
+         set_vabits2( dst+i, vabits2, ctx );
          if (VA_BITS2_PARTDEFINED == vabits2) {
-            set_sec_vbits8( dst+i, get_sec_vbits8( src+i ) );
+            set_sec_vbits8( dst+i, get_sec_vbits8( src+i ), ctx );
          }
          i++;
          len--;
@@ -1949,10 +2058,10 @@ void MC_(copy_address_range_state) ( Addr src, Addr dst, SizeT len )
       if (src < dst) {
          for (i = 0, j = len-1; i < len; i++, j--) {
             PROF_EVENT(MCPE_COPY_ADDRESS_RANGE_STATE_LOOP1);
-            vabits2 = get_vabits2( src+j );
-            set_vabits2( dst+j, vabits2 );
+            vabits2 = get_vabits2( src+j, ctx );
+            set_vabits2( dst+j, vabits2, ctx );
             if (VA_BITS2_PARTDEFINED == vabits2) {
-               set_sec_vbits8( dst+j, get_sec_vbits8( src+j ) );
+               set_sec_vbits8( dst+j, get_sec_vbits8( src+j ), ctx );
             }
          }
       }
@@ -1960,10 +2069,10 @@ void MC_(copy_address_range_state) ( Addr src, Addr dst, SizeT len )
       if (src > dst) {
          for (i = 0; i < len; i++) {
             PROF_EVENT(MCPE_COPY_ADDRESS_RANGE_STATE_LOOP2);
-            vabits2 = get_vabits2( src+i );
-            set_vabits2( dst+i, vabits2 );
+            vabits2 = get_vabits2( src+i, ctx );
+            set_vabits2( dst+i, vabits2, ctx );
             if (VA_BITS2_PARTDEFINED == vabits2) {
-               set_sec_vbits8( dst+i, get_sec_vbits8( src+i ) );
+               set_sec_vbits8( dst+i, get_sec_vbits8( src+i ), ctx );
             }
          }
       }
@@ -3755,15 +3864,17 @@ typedef
    returns False, and if bad_addr is non-NULL, sets *bad_addr to
    indicate the lowest failing address.  Functions below are
    similar. */
-Bool MC_(check_mem_is_noaccess) ( Addr a, SizeT len, Addr* bad_addr )
+Bool MC_(check_mem_is_noaccess) ( Addr a, SizeT len, ThreadId tid,
+                                  Addr* bad_addr )
 {
    SizeT i;
    UWord vabits2;
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
 
    PROF_EVENT(MCPE_CHECK_MEM_IS_NOACCESS);
    for (i = 0; i < len; i++) {
       PROF_EVENT(MCPE_CHECK_MEM_IS_NOACCESS_LOOP);
-      vabits2 = get_vabits2(a);
+      vabits2 = get_vabits2(a, ctx);
       if (VA_BITS2_NOACCESS != vabits2) {
          if (bad_addr != NULL) *bad_addr = a;
          return False;
@@ -3773,16 +3884,17 @@ Bool MC_(check_mem_is_noaccess) ( Addr a, SizeT len, Addr* bad_addr )
    return True;
 }
 
-static Bool is_mem_addressable ( Addr a, SizeT len, 
+static Bool is_mem_addressable ( Addr a, SizeT len, ThreadId tid,
                                  /*OUT*/Addr* bad_addr )
 {
    SizeT i;
    UWord vabits2;
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
 
    PROF_EVENT(MCPE_IS_MEM_ADDRESSABLE);
    for (i = 0; i < len; i++) {
       PROF_EVENT(MCPE_IS_MEM_ADDRESSABLE_LOOP);
-      vabits2 = get_vabits2(a);
+      vabits2 = get_vabits2(a, ctx);
       if (VA_BITS2_NOACCESS == vabits2) {
          if (bad_addr != NULL) *bad_addr = a;
          return False;
@@ -3792,21 +3904,23 @@ static Bool is_mem_addressable ( Addr a, SizeT len,
    return True;
 }
 
-static MC_ReadResult is_mem_defined ( Addr a, SizeT len,
+static MC_ReadResult is_mem_defined ( Addr a, SizeT len, ThreadId tid,
                                       /*OUT*/Addr* bad_addr,
                                       /*OUT*/UInt* otag )
 {
    SizeT i;
    UWord vabits2;
+   UChar ctx;
 
    PROF_EVENT(MCPE_IS_MEM_DEFINED);
    DEBUG("is_mem_defined\n");
 
+   ctx = VG_(get_ThreadState)(tid)->context;
    if (otag)     *otag = 0;
    if (bad_addr) *bad_addr = 0;
    for (i = 0; i < len; i++) {
       PROF_EVENT(MCPE_IS_MEM_DEFINED_LOOP);
-      vabits2 = get_vabits2(a);
+      vabits2 = get_vabits2(a, ctx);
       if (VA_BITS2_DEFINED != vabits2) {
          // Error!  Nb: Report addressability errors in preference to
          // definedness errors.  And don't report definedeness errors unless
@@ -3841,6 +3955,7 @@ static MC_ReadResult is_mem_defined ( Addr a, SizeT len,
    necessary. */
 static void is_mem_defined_comprehensive (
                Addr a, SizeT len,
+               ThreadId tid,
                /*OUT*/Bool* errorV,    /* is there a definedness err? */
                /*OUT*/Addr* bad_addrV, /* if so where? */
                /*OUT*/UInt* otagV,     /* and what's its otag? */
@@ -3851,15 +3966,17 @@ static void is_mem_defined_comprehensive (
    SizeT i;
    UWord vabits2;
    Bool  already_saw_errV = False;
+   UChar ctx;
 
    PROF_EVENT(MCPE_IS_MEM_DEFINED_COMPREHENSIVE);
    DEBUG("is_mem_defined_comprehensive\n");
 
    tl_assert(!(*errorV || *errorA));
+   ctx = VG_(get_ThreadState)(tid)->context;
 
    for (i = 0; i < len; i++) {
       PROF_EVENT(MCPE_IS_MEM_DEFINED_COMPREHENSIVE_LOOP);
-      vabits2 = get_vabits2(a);
+      vabits2 = get_vabits2(a, ctx);
       switch (vabits2) {
          case VA_BITS2_DEFINED: 
             a++; 
@@ -3893,18 +4010,19 @@ static void is_mem_defined_comprehensive (
    examine the actual bytes, to find the end, until we're sure it is
    safe to do so. */
 
-static Bool mc_is_defined_asciiz ( Addr a, Addr* bad_addr, UInt* otag )
+static Bool mc_is_defined_asciiz ( Addr a, ThreadId tid, Addr* bad_addr, UInt* otag )
 {
    UWord vabits2;
 
    PROF_EVENT(MCPE_IS_DEFINED_ASCIIZ);
    DEBUG("mc_is_defined_asciiz\n");
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
 
    if (otag)     *otag = 0;
    if (bad_addr) *bad_addr = 0;
    while (True) {
       PROF_EVENT(MCPE_IS_DEFINED_ASCIIZ_LOOP);
-      vabits2 = get_vabits2(a);
+      vabits2 = get_vabits2(a, ctx);
       if (VA_BITS2_DEFINED != vabits2) {
          // Error!  Nb: Report addressability errors in preference to
          // definedness errors.  And don't report definedeness errors unless
@@ -3940,7 +4058,7 @@ void check_mem_is_addressable ( CorePart part, ThreadId tid, const HChar* s,
                                 Addr base, SizeT size )
 {
    Addr bad_addr;
-   Bool ok = is_mem_addressable ( base, size, &bad_addr );
+   Bool ok = is_mem_addressable ( base, size, tid, &bad_addr );
 
    if (!ok) {
       switch (part) {
@@ -3965,7 +4083,7 @@ void check_mem_is_defined ( CorePart part, ThreadId tid, const HChar* s,
 {     
    UInt otag = 0;
    Addr bad_addr;
-   MC_ReadResult res = is_mem_defined ( base, size, &bad_addr, &otag );
+   MC_ReadResult res = is_mem_defined ( base, size, tid, &bad_addr, &otag );
 
    if (MC_Ok != res) {
       Bool isAddrErr = ( MC_AddrErr == res ? True : False );
@@ -4001,7 +4119,7 @@ void check_mem_is_defined_asciiz ( CorePart part, ThreadId tid,
    UInt otag = 0;
 
    tl_assert(part == Vg_CoreSysCall);
-   res = mc_is_defined_asciiz ( (Addr)str, &bad_addr, &otag );
+   res = mc_is_defined_asciiz ( (Addr)str, tid, &bad_addr, &otag );
    if (MC_Ok != res) {
       Bool isAddrErr = ( MC_AddrErr == res ? True : False );
       MC_(record_memparam_error) ( tid, bad_addr, isAddrErr, s,
@@ -4081,7 +4199,7 @@ void mc_new_mem_mprotect ( Addr a, SizeT len, Bool rr, Bool ww, Bool xx )
 {
    if (rr || ww || xx) {
       /* (4) mprotect other  ->  change any "noaccess" to "defined" */
-      make_mem_defined_if_noaccess(a, len);
+      make_mem_defined_if_noaccess(a, len, VG_(get_running_tid)());
    } else {
       /* (3) mprotect NONE   ->  # no change */
       /* do nothing */
@@ -4216,10 +4334,11 @@ static void mc_copy_mem_to_reg ( CorePart part, ThreadId tid, Addr a,
    UChar vbits8;
    Int offset;
    UInt d32;
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
 
    /* Slow loop. */
    for (i = 0; i < size; i++) {
-      get_vbits8( a+i, &vbits8 );
+      get_vbits8( a+i, &vbits8, ctx );
       VG_(set_shadow_regs_area)( tid, 1/*shadowNo*/, guest_state_offset+i,
                                  1, &vbits8 );
    }
@@ -4266,12 +4385,13 @@ static void mc_copy_reg_to_mem ( CorePart part, ThreadId tid,
    UChar vbits8;
    Int offset;
    UInt d32;
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
 
    /* Slow loop. */
    for (i = 0; i < size; i++) {
       VG_(get_shadow_regs_area)( tid, &vbits8, 1/*shadowNo*/,
                                  guest_state_offset+i, 1 );
-      set_vbits8( a+i, vbits8 );
+      set_vbits8( a+i, vbits8, ctx );
    }
 
    if (MC_(clo_mc_level) != 3)
@@ -5464,12 +5584,15 @@ static Int mc_get_or_set_vbits_for_client (
    SizeT i;
    Bool  ok;
    UChar vbits8;
+   ThreadId tid = VG_(get_running_tid)();
+   UChar ctx = VG_(get_ThreadState)(tid)->context;
 
    /* Check that arrays are addressible before doing any getting/setting.
       vbits to be checked only for real user request. */
    for (i = 0; i < szB; i++) {
-      if (VA_BITS2_NOACCESS == get_vabits2(a + i) ||
-          (is_client_request && VA_BITS2_NOACCESS == get_vabits2(vbits + i))) {
+      if (VA_BITS2_NOACCESS == get_vabits2(a + i, ctx) ||
+          (is_client_request &&
+                VA_BITS2_NOACCESS == get_vabits2(vbits + i, ctx))) {
          return 3;
       }
    }
@@ -5478,13 +5601,13 @@ static Int mc_get_or_set_vbits_for_client (
    if (setting) {
       /* setting */
       for (i = 0; i < szB; i++) {
-         ok = set_vbits8(a + i, ((UChar*)vbits)[i]);
+         ok = set_vbits8(a + i, ((UChar*)vbits)[i], ctx);
          tl_assert(ok);
       }
    } else {
       /* getting */
       for (i = 0; i < szB; i++) {
-         ok = get_vbits8(a + i, &vbits8);
+         ok = get_vbits8(a + i, &vbits8, ctx);
          tl_assert(ok);
          ((UChar*)vbits)[i] = vbits8;
       }
@@ -5560,11 +5683,15 @@ static void init_shadow_memory ( void )
    sm = &sm_distinguished[SM_DIST_DEFINED];
    for (i = 0; i < SM_CHUNKS; i++) sm->vabits8[i] = VA_BITS8_DEFINED;
 
+   VG_(memset)(&ctx_distinguished.ctxbits8, 0, sizeof (ctx_distinguished.ctxbits8));
+
    /* Set up the primary map. */
    /* These entries gradually get overwritten as the used address
       space expands. */
-   for (i = 0; i < N_PRIMARY_MAP; i++)
+   for (i = 0; i < N_PRIMARY_MAP; i++) {
       primary_map[i] = &sm_distinguished[SM_DIST_NOACCESS];
+      primary_ctx_map[i] = &ctx_distinguished;
+   }
 
    /* Auxiliary primary maps */
    init_auxmap_L1_L2();
@@ -6246,7 +6373,7 @@ static Bool handle_gdb_monitor_command (ThreadId tid, HChar *req)
       case  1: make_mem_undefined_w_tid_and_okind ( address, szB, tid, 
                                                     MC_OKIND_USER ); break;
       case  2: MC_(make_mem_defined) ( address, szB ); break;
-      case  3: make_mem_defined_if_addressable ( address, szB ); break;;
+      case  3: make_mem_defined_if_addressable ( address, szB, tid ); break;;
       default: tl_assert(0);
       }
       return True;
@@ -6272,7 +6399,7 @@ static Bool handle_gdb_monitor_command (ThreadId tid, HChar *req)
       case -2: break;
       case -1: break;
       case  0: /* addressable */
-         if (is_mem_addressable ( address, szB, &bad_addr ))
+         if (is_mem_addressable ( address, szB, tid, &bad_addr ))
             VG_(printf) ("Address %p len %lu addressable\n", 
                              (void *)address, szB);
          else
@@ -6282,7 +6409,7 @@ static Bool handle_gdb_monitor_command (ThreadId tid, HChar *req)
          MC_(pp_describe_addr) (address);
          break;
       case  1: /* defined */
-         res = is_mem_defined ( address, szB, &bad_addr, &otag );
+         res = is_mem_defined ( address, szB, tid, &bad_addr, &otag );
          if (MC_AddrErr == res)
             VG_(printf)
                ("Address %p len %lu not addressable:\nbad address %p\n",
@@ -6469,7 +6596,7 @@ static Bool mc_handle_client_request ( ThreadId tid, UWord* arg, UWord* ret )
 
    switch (arg[0]) {
       case VG_USERREQ__CHECK_MEM_IS_ADDRESSABLE: {
-         Bool ok = is_mem_addressable ( arg[1], arg[2], &bad_addr );
+         Bool ok = is_mem_addressable ( arg[1], arg[2], tid, &bad_addr );
          if (!ok)
             MC_(record_user_error) ( tid, bad_addr, /*isAddrErr*/True, 0 );
          *ret = ok ? (UWord)NULL : bad_addr;
@@ -6483,7 +6610,7 @@ static Bool mc_handle_client_request ( ThreadId tid, UWord* arg, UWord* ret )
          Bool errorA    = False;
          Addr bad_addrA = 0;
          is_mem_defined_comprehensive( 
-            arg[1], arg[2],
+            arg[1], arg[2], tid,
             &errorV, &bad_addrV, &otagV, &errorA, &bad_addrA
          );
          if (errorV) {
@@ -6562,7 +6689,7 @@ static Bool mc_handle_client_request ( ThreadId tid, UWord* arg, UWord* ret )
          break;
 
       case VG_USERREQ__MAKE_MEM_DEFINED_IF_ADDRESSABLE:
-         make_mem_defined_if_addressable ( arg[1], arg[2] );
+         make_mem_defined_if_addressable ( arg[1], arg[2], tid );
          *ret = -1;
          break;
 
@@ -6760,6 +6887,18 @@ static Bool mc_handle_client_request ( ThreadId tid, UWord* arg, UWord* ret )
          Bool ok
             = modify_ignore_ranges(addRange, arg[1], arg[2]);
          *ret = ok ? 1 : 0;
+         return True;
+      }
+
+      case VG_USERREQ__ALLOCATE_CONTEXT: {
+         return True;
+      }
+      case VG_USERREQ__SWITCH_CONTEXT_TO: {
+         ThreadState *state = VG_(get_ThreadState)(tid);
+
+         *ret = state->context;
+         state->context = arg[1];
+
          return True;
       }
 

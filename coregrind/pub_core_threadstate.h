@@ -401,6 +401,8 @@ typedef struct {
 
    /* This thread's name. NULL, if no name. */
    HChar *thread_name;
+
+   UChar context;
 }
 ThreadState;
 

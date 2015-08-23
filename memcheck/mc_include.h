@@ -133,7 +133,8 @@ extern VgHashTable *MC_(malloc_list);
 extern VgHashTable *MC_(mempool_list);
 
 /* Shadow memory functions */
-Bool MC_(check_mem_is_noaccess)( Addr a, SizeT len, Addr* bad_addr );
+Bool MC_(check_mem_is_noaccess)    ( Addr a, SizeT len, ThreadId tid,
+                                     Addr* bad_addr );
 void MC_(make_mem_noaccess)        ( Addr a, SizeT len );
 void MC_(make_mem_undefined_w_otag)( Addr a, SizeT len, UInt otag );
 void MC_(make_mem_defined)         ( Addr a, SizeT len );
